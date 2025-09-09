@@ -1,19 +1,14 @@
 """
-trinity_advanced_version.py (réécrit)
--------------------------------------
-Moteur métier "Trinity" utilisé par l'app Streamlit.
-
-• Fournit la classe TrinityBot
-• Utilise OpenAI (fallback clé depuis variables d'environnement)
-• Interroge l'API PrestaShop en JSON (fallback mini-catalogue si indisponible)
-• Construit des URLs produits **propres** via `/{id}-{link_rewrite}.html` si possible,
-  sinon fallback vers `index.php?id_product=...&controller=product`.
-
-Dépendances :
-  pip install openai requests
-
-Remarque : module pur Python (pas de dépendance Streamlit).
+trinity_advanced_version.py (version corrigée complète)
+--------------------------------------------------------
+Moteur métier "Trinity" avec toutes les corrections :
+- Tracking des questions pour éviter les répétitions
+- Chargement obligatoire du catalogue
+- URLs correctes : domain/category/id-slug
+- Priorité à la marque "Le Vapoteur Discount"
+- Limites configurables pour produits/marques/catégories
 """
+
 from __future__ import annotations
 
 import os
@@ -22,10 +17,11 @@ import json
 import math
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import requests
 from openai import OpenAI
+
 
 # =============================
 # 🧱 Contexte de session client
@@ -37,6 +33,10 @@ class SessionContext:
     conversation_stage: str = "discovery"  # discovery | qualification | recommendation | closing
     budget: Optional[str] = None
     products_shown: List[int] = field(default_factory=list)
+    # NOUVEAU: Tracking des questions déjà posées pour éviter les répétitions
+    questions_asked: Set[str] = field(default_factory=set)
+    # NOUVEAU: Stockage des préférences utilisateur extraites
+    user_preferences: Dict[str, str] = field(default_factory=dict)
 
 
 # ================
@@ -44,14 +44,17 @@ class SessionContext:
 # ================
 
 def _clean(s: str) -> str:
+    """Nettoie une chaîne."""
     return (s or "").strip()
 
 
 def _token_estimate(text: str) -> int:
+    """Estime le nombre de tokens (1 token ≈ 4 caractères)."""
     return max(1, math.ceil(len(text) / 4))
 
 
 def _score_match(name: str, query: str) -> int:
+    """Score de correspondance entre un nom de produit et une requête."""
     name_l = (name or "").lower()
     score = 0
     for w in set(re.findall(r"\w+", (query or "").lower())):
@@ -61,95 +64,108 @@ def _score_match(name: str, query: str) -> int:
 
 
 def _extract_lang_value(value) -> Optional[str]:
-    """PrestaShop peut renvoyer soit une string, soit un mapping/liste par langue."""
+    """Extrait la valeur depuis les structures multilingues PrestaShop."""
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        # cas fréquent : {"language": "slug"} OU {"language": [{"@id":"1","#text":"slug"}, ...]}
         lang = value.get("language")
         if isinstance(lang, str):
             return lang
         if isinstance(lang, list) and lang:
-            # on tente #text ou value
             first = lang[0]
             if isinstance(first, dict):
-                return first.get("#text") or first.get("value") or first.get("_" )
+                return first.get("#text") or first.get("value") or first.get("_")
     return None
 
 
-def build_product_url(base_url: str, product_id: int, link_rewrite: Optional[str] = None, id_lang: Optional[int] = None) -> str:
-    """Construit une URL produit robuste.
-    - Si link_rewrite dispo → /{id}-{link_rewrite}.html (PS 1.7/8 routes SEO par défaut)
-    - Sinon → fallback /index.php?id_product=..&controller=product (+ id_lang si fourni)
+def build_product_url(base_url: str, product_id: int, category_slug: str, product_slug: str) -> str:
+    """
+    Construit une URL produit PrestaShop au format correct :
+    domain/category/id-slug
+    
+    Ex: https://www.levapoteur-discount.fr/pods/123-kit-debutant-eco
     """
     base = (base_url or "").rstrip("/") or "https://www.levapoteur-discount.fr"
-    if link_rewrite:
-        # URL propre (SEO)
-        return f"{base}/{product_id}-{link_rewrite}.html"
-    # Fallback legacy
-    if id_lang:
-        return f"{base}/index.php?id_product={product_id}&controller=product&id_lang={id_lang}"
-    return f"{base}/index.php?id_product={product_id}&controller=product"
+    
+    if category_slug and product_slug:
+        # Format standard PrestaShop
+        return f"{base}/{category_slug}/{product_id}-{product_slug}"
+    
+    # Fallback si pas de catégorie
+    return f"{base}/produits/{product_id}-{product_slug or 'produit'}"
 
 
 # ===================
-# 🔌 Client PrestaShop
+# 📌 Client PrestaShop
 # ===================
 
 class PrestaClient:
+    """Client pour l'API PrestaShop."""
+    
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None, timeout: int = 15):
-        # Fallback secrets/env pour robustesse
         self.base_url = (base_url or os.getenv("PRESTASHOP_URL") or "https://www.levapoteur-discount.fr").rstrip("/")
         self.api_key = api_key or os.getenv("PRESTASHOP_API_KEY") or ""
         self.timeout = timeout
-
         self.session = requests.Session()
+        
         if self.api_key:
-            # Basic Auth: clé en user, mdp vide
+            # Authentification Basic : clé API comme username, password vide
             self.session.auth = (self.api_key, "")
         self.session.headers.update({"Accept": "application/json"})
 
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
+        """Effectue une requête GET sur l'API."""
         url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
         p = {"output_format": "JSON"}
         if params:
             p.update(params)
+        
         resp = self.session.get(url, params=p, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
     def fetch_products(self, limit: int = 250) -> List[Dict]:
-        """Récupère un set minimal de champs pour construire les URLs et l'affichage."""
-        # Essai avec display filtré pour limiter la taille
-        fields = "[id,id_lang,id_default_image,manufacturer_name,price,name,link_rewrite,active]"
+        """Récupère les produits avec leurs catégories pour construire les URLs."""
+        # Champs nécessaires pour l'affichage et les URLs
+        fields = "[id,id_default_category,manufacturer_name,price,name,link_rewrite,active,description_short]"
+        
         try:
-            data = self._get("products", {"display": fields, "limit": limit, "filter[active]": 1})
-        except Exception:
-            data = self._get("products", {"limit": limit})
+            data = self._get("products", {
+                "display": fields,
+                "limit": limit,
+                "filter[active]": 1
+            })
+        except Exception as e:
+            raise ConnectionError(f"Impossible de récupérer les produits : {e}")
+        
         items = data.get("products", [])
-
+        
+        # Récupérer le mapping des catégories
+        categories_map = self._fetch_categories_map()
+        
         out: List[Dict] = []
         for it in items:
             try:
                 pid = int(it.get("id"))
+                cat_id = int(it.get("id_default_category", 0))
                 name_raw = it.get("name")
                 slug_raw = it.get("link_rewrite")
                 brand = _clean(it.get("manufacturer_name") or "")
                 price = float(it.get("price", 0.0) or 0.0)
-
+                
+                # Extraire les valeurs multilingues
                 name = _clean(_extract_lang_value(name_raw) or (name_raw if isinstance(name_raw, str) else "Produit"))
                 slug = _clean(_extract_lang_value(slug_raw) or "")
-
-                # id_lang est rarement exposé directement, on tente de l'extraire, sinon None
-                id_lang = None
-                if isinstance(it.get("id_lang"), (int, str)):
-                    try:
-                        id_lang = int(it.get("id_lang"))
-                    except Exception:
-                        id_lang = None
-
-                url = build_product_url(self.base_url, pid, link_rewrite=slug or None, id_lang=id_lang)
-
+                
+                # Récupérer le slug de la catégorie
+                cat_slug = categories_map.get(cat_id, "produits")
+                
+                # Construire l'URL correcte
+                url = build_product_url(self.base_url, pid, cat_slug, slug)
+                
+                # Détecter si c'est un produit de la marque Le Vapoteur Discount
+                is_lvd = any(x in brand.lower() for x in ["vapoteur", "lvd", "discount"])
+                
                 out.append({
                     "id": pid,
                     "name": name,
@@ -157,22 +173,58 @@ class PrestaClient:
                     "price": price,
                     "url": url,
                     "slug": slug,
+                    "category_id": cat_id,
+                    "category_slug": cat_slug,
+                    "is_lvd": is_lvd,  # Flag pour prioriser les produits LVD
                 })
             except Exception:
                 continue
+        
         return out
 
-    def fetch_manufacturers(self) -> List[str]:
+    def _fetch_categories_map(self) -> Dict[int, str]:
+        """Récupère le mapping id_category -> slug pour construire les URLs."""
         try:
-            data = self._get("manufacturers", {"display": "[name]", "limit": 250})
+            data = self._get("categories", {
+                "display": "[id,link_rewrite]",
+                "limit": 500
+            })
+            cats = data.get("categories", [])
+            
+            result = {}
+            for c in cats:
+                try:
+                    cat_id = int(c.get("id"))
+                    slug_raw = c.get("link_rewrite")
+                    slug = _clean(_extract_lang_value(slug_raw) or "")
+                    if slug:
+                        result[cat_id] = slug
+                except Exception:
+                    continue
+            
+            return result
+        except Exception:
+            return {}
+
+    def fetch_manufacturers(self, limit: int = 100) -> List[str]:
+        """Récupère la liste des marques."""
+        try:
+            data = self._get("manufacturers", {
+                "display": "[name]",
+                "limit": limit
+            })
             mans = data.get("manufacturers", [])
             return [_clean(_extract_lang_value(m.get("name")) or m.get("name", "")) for m in mans]
-        except Exception:
-            return []
+        except Exception as e:
+            raise ConnectionError(f"Impossible de récupérer les marques : {e}")
 
-    def fetch_categories(self) -> List[str]:
+    def fetch_categories(self, limit: int = 100) -> List[str]:
+        """Récupère la liste des catégories."""
         try:
-            data = self._get("categories", {"display": "[name,link_rewrite]", "limit": 250})
+            data = self._get("categories", {
+                "display": "[name]",
+                "limit": limit
+            })
             cats = data.get("categories", [])
             out = []
             for c in cats:
@@ -180,8 +232,8 @@ class PrestaClient:
                 if isinstance(nm, str) and nm.strip():
                     out.append(_clean(nm))
             return out
-        except Exception:
-            return []
+        except Exception as e:
+            raise ConnectionError(f"Impossible de récupérer les catégories : {e}")
 
 
 # ==============================
@@ -189,203 +241,456 @@ class PrestaClient:
 # ==============================
 
 class TrinityBot:
+    """
+    Bot Trinity - Assistant expert pour Le Vapoteur Discount.
+    
+    Fonctionnalités principales :
+    - Chargement du catalogue PrestaShop obligatoire
+    - Tracking des questions pour éviter les répétitions
+    - Priorité aux produits de la marque LVD
+    - Personnalisation selon le profil client
+    """
+    
     def __init__(
         self,
         prestashop_url: Optional[str] = None,
         prestashop_key: Optional[str] = None,
         openai_api_key: Optional[str] = None,
+        products_limit: int = 500,
+        brands_limit: int = 100,
+        categories_limit: int = 100,
     ):
-        """Initialise Trinity avec fallbacks (env).
-
-        - PRESTASHOP_URL, PRESTASHOP_API_KEY
-        - OPENAI_API_KEY
         """
-        self.prestashop_url = (prestashop_url or os.getenv("PRESTASHOP_URL") or "https://www.levapoteur-discount.fr")
+        Initialise Trinity avec limites configurables.
+        
+        Args:
+            prestashop_url: URL de la boutique PrestaShop
+            prestashop_key: Clé API PrestaShop
+            openai_api_key: Clé API OpenAI
+            products_limit: Nombre max de produits à récupérer (ou -1 pour tout)
+            brands_limit: Nombre max de marques à récupérer (ou -1 pour tout)
+            categories_limit: Nombre max de catégories à récupérer (ou -1 pour tout)
+        """
+        self.prestashop_url = prestashop_url or os.getenv("PRESTASHOP_URL") or "https://www.levapoteur-discount.fr"
         self.prestashop_key = prestashop_key or os.getenv("PRESTASHOP_API_KEY") or ""
-
-        # Fallback clé OpenAI via env si non fournie par l'UI
+        
+        # Clé OpenAI obligatoire
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
-            raise RuntimeError("Clé OpenAI manquante. Renseigne OPENAI_API_KEY (UI, secrets ou env)")
-
+            raise RuntimeError("Clé OpenAI manquante. Renseigne OPENAI_API_KEY")
+        
         self.client = OpenAI(api_key=self.openai_api_key)
-
+        
+        # Contexte de session
         self.session_context = SessionContext()
-        self.catalog: List[Dict] = []  # [{id,name,brand,price,url,slug}]
+        
+        # Catalogue
+        self.catalog: List[Dict] = []
         self.manufacturers: List[str] = []
         self.categories: List[str] = []
-
+        
+        # Limites configurables (-1 = tout récupérer)
+        self.products_limit = products_limit if products_limit != -1 else 99999
+        self.brands_limit = brands_limit if brands_limit != -1 else 99999
+        self.categories_limit = categories_limit if categories_limit != -1 else 99999
+        
+        # Logger
         self._logger = logging.getLogger("TrinityBot")
         self._logger.setLevel(logging.INFO)
+        
+        # Flag pour savoir si le catalogue est chargé
+        self.catalog_loaded = False
 
-    # --------- Catalogue ---------
     def load_catalog_data(self, force_update: bool = False) -> None:
-        """Charge (ou recharge) les données de catalogue depuis PrestaShop.
-        Fallback : mini-catalogue local si l'API échoue.
         """
-        if self.catalog and not force_update:
+        Charge les données depuis PrestaShop.
+        Lève une exception si l'API ne répond pas (pas de fallback).
+        """
+        if self.catalog_loaded and not force_update:
             return
-
+        
         try:
             pc = PrestaClient(self.prestashop_url, self.prestashop_key)
-            self.catalog = pc.fetch_products(limit=500)
-            self.manufacturers = pc.fetch_manufacturers()
-            self.categories = pc.fetch_categories()
-            # Déduplication simple par id
+            
+            # Récupération avec les limites configurées
+            self.catalog = pc.fetch_products(limit=self.products_limit)
+            self.manufacturers = pc.fetch_manufacturers(limit=self.brands_limit)
+            self.categories = pc.fetch_categories(limit=self.categories_limit)
+            
+            # Dédupliquer par ID
             seen = set()
             dedup = []
             for p in self.catalog:
-                if p["id"] in seen:
-                    continue
-                seen.add(p["id"])
-                dedup.append(p)
+                if p["id"] not in seen:
+                    seen.add(p["id"])
+                    dedup.append(p)
             self.catalog = dedup
+            
+            # Trier pour mettre LVD en premier
+            self.catalog.sort(key=lambda x: (not x.get("is_lvd", False), x.get("price", 0)))
+            
+            self.catalog_loaded = True
+            self._logger.info(f"Catalogue chargé: {len(self.catalog)} produits, {len(self.manufacturers)} marques, {len(self.categories)} catégories")
+            
+        except ConnectionError as e:
+            # Pas de fallback - on lève l'erreur
+            raise ConnectionError("Service temporairement indisponible. L'API PrestaShop ne répond pas.")
         except Exception as e:
-            self._logger.warning(f"PrestaShop indisponible, fallback local. Raison: {e}")
-            self.catalog = self._fallback_catalog()
-            self.manufacturers = sorted(list({p["brand"] for p in self.catalog if p.get("brand")}))
-            self.categories = ["Kits débutants", "Pods", "E-liquides fruités", "E-liquides classiques", "Sels de nicotine"]
+            raise Exception(f"Erreur lors du chargement du catalogue: {e}")
 
-    def _fallback_catalog(self) -> List[Dict]:
-        base = (self.prestashop_url or "https://www.levapoteur-discount.fr").rstrip("/")
-        def u(pid: int, slug: str) -> str:
-            return build_product_url(base, pid, link_rewrite=slug)
-        return [
-            {"id": 101, "name": "Kit Débutant Eco 20W", "brand": "LVD", "price": 19.9, "url": u(101, "kit-debutant-eco-20w"), "slug": "kit-debutant-eco-20w"},
-            {"id": 102, "name": "Pod Compact 900mAh", "brand": "LVD", "price": 24.9, "url": u(102, "pod-compact-900mah"), "slug": "pod-compact-900mah"},
-            {"id": 103, "name": "Pack Démarrage Vape + 3 e-liquides", "brand": "LVD", "price": 29.9, "url": u(103, "pack-demarrage-vape-3-eliquides"), "slug": "pack-demarrage-vape-3-eliquides"},
-            {"id": 201, "name": "E-liquide Fraise 10ml 12mg", "brand": "FruitMania", "price": 3.9, "url": u(201, "eliquide-fraise-10ml-12mg"), "slug": "eliquide-fraise-10ml-12mg"},
-            {"id": 202, "name": "E-liquide Classic Blond 10ml 12mg", "brand": "Tabac&Co", "price": 3.9, "url": u(202, "eliquide-classic-blond-10ml-12mg"), "slug": "eliquide-classic-blond-10ml-12mg"},
-            {"id": 203, "name": "Sel de Nicotine Menthe 20mg", "brand": "FreshNic", "price": 4.9, "url": u(203, "sel-nicotine-menthe-20mg"), "slug": "sel-nicotine-menthe-20mg"},
-            {"id": 301, "name": "Clearomiseur MTL 2ml", "brand": "VapoTech", "price": 14.9, "url": u(301, "clearomiseur-mtl-2ml"), "slug": "clearomiseur-mtl-2ml"},
-        ]
+    def is_ready(self) -> bool:
+        """Vérifie si le bot est prêt (catalogue chargé)."""
+        return self.catalog_loaded
 
-    # --------- Construction de contexte ---------
     def build_context(self, user_query: str) -> str:
+        """
+        Construit le contexte pour l'IA en évitant les répétitions.
+        Inclut les préférences déjà connues et les questions déjà posées.
+        """
+        if not self.catalog_loaded:
+            raise RuntimeError("Le catalogue n'est pas chargé")
+        
         prof = self.session_context.profile
         stage = self.session_context.conversation_stage
         budget = self.session_context.budget or "non défini"
         already = set(self.session_context.products_shown)
-
-        # Recherche rapide de produits pertinents
+        
+        # Analyser la requête pour extraire les préférences
+        self._extract_preferences(user_query)
+        
+        # Recherche de produits avec priorité LVD
         top = self._search_products(user_query, k=10, exclude_ids=already)
-
+        
         lines = [
             f"PROFIL: {prof}",
             f"STAGE: {stage}",
             f"BUDGET: {budget}",
             f"NB_PRODUITS_MONTRÉS: {len(already)}",
         ]
-        if self.categories:
+        
+        # Ajouter les préférences extraites (pour éviter de reposer les questions)
+        if self.session_context.user_preferences:
+            lines.append("PRÉFÉRENCES_CLIENT (déjà connues):")
+            for key, val in self.session_context.user_preferences.items():
+                lines.append(f"  - {key}: {val}")
+        
+        # Questions déjà posées (pour ne pas les répéter)
+        if self.session_context.questions_asked:
+            lines.append(f"QUESTIONS_DÉJÀ_POSÉES: {', '.join(self.session_context.questions_asked)}")
+        
+        # Catégories et marques disponibles
+        if self.categories[:10]:
             lines.append("CATÉGORIES_DISPO: " + ", ".join(self.categories[:10]))
-        if self.manufacturers:
+        if self.manufacturers[:10]:
             lines.append("MARQUES_DISPO: " + ", ".join(self.manufacturers[:10]))
-        lines.append("\nPRODUITS_CANDIDATS:")
-
+        
+        lines.append("\nPRODUITS_CANDIDATS (priorité LVD):")
+        
+        # Lister les produits avec flag LVD
         for p in top:
-            lines.append(f"- [{p['id']}] {p['name']} | {p['brand']} | {p['price']:.2f}€ | {p['url']}")
-
+            lvd_flag = " [⭐ MARQUE LVD - À PRIVILÉGIER]" if p.get("is_lvd") else ""
+            lines.append(f"- [{p['id']}] {p['name']} | {p['brand']}{lvd_flag} | {p['price']:.2f}€ | {p['url']}")
+        
         return "\n".join(lines)
 
-    # --------- Objections & Qualification ---------
+    def _extract_preferences(self, user_query: str) -> None:
+        """
+        Extrait et stocke les préférences de l'utilisateur depuis sa requête.
+        Évite de reposer des questions sur les infos déjà données.
+        """
+        query_lower = user_query.lower()
+        
+        # Extraction du nombre de cigarettes
+        cig_match = re.search(r'(\d+)\s*cigarette', query_lower)
+        if cig_match:
+            self.session_context.user_preferences["cigarettes_par_jour"] = cig_match.group(1)
+            self.session_context.questions_asked.add("cigarettes")
+        
+        # Extraction des goûts
+        if any(w in query_lower for w in ["fruité", "fruit", "fraise", "mangue", "cerise", "pomme", "pêche"]):
+            self.session_context.user_preferences["gout"] = "fruité"
+            self.session_context.questions_asked.add("gout")
+        elif any(w in query_lower for w in ["tabac", "blond", "brun", "classic"]):
+            self.session_context.user_preferences["gout"] = "tabac"
+            self.session_context.questions_asked.add("gout")
+        elif any(w in query_lower for w in ["menthe", "menthol", "frais", "mint"]):
+            self.session_context.user_preferences["gout"] = "menthol"
+            self.session_context.questions_asked.add("gout")
+        
+        # Extraction du type souhaité
+        if any(w in query_lower for w in ["simple", "facile", "pod", "débutant"]):
+            self.session_context.user_preferences["type"] = "pod simple"
+            self.session_context.questions_asked.add("type")
+        elif any(w in query_lower for w in ["évolutif", "personnalis", "modulable", "avancé"]):
+            self.session_context.user_preferences["type"] = "évolutif"
+            self.session_context.questions_asked.add("type")
+        
+        # Extraction nicotine
+        nic_match = re.search(r'(\d+)\s*mg', query_lower)
+        if nic_match:
+            self.session_context.user_preferences["nicotine"] = f"{nic_match.group(1)}mg"
+            self.session_context.questions_asked.add("nicotine")
+        
+        # Extraction budget
+        budget_match = re.search(r'(\d+)\s*(?:€|euro)', query_lower)
+        if budget_match:
+            self.session_context.budget = f"{budget_match.group(1)}€"
+            self.session_context.questions_asked.add("budget")
+
     def handle_objection(self, utterance: str) -> str:
+        """Gère les objections courantes avec empathie."""
         t = (utterance or "").lower()
+        
         if any(k in t for k in ["cher", "prix", "trop", "budget"]):
             return (
-                "Je comprends le budget. On peut partir sur un pack économique fiable, "
-                "puis monter en gamme plus tard. Je te propose 1 kit d’entrée + 2 e-liquides 🎯"
+                "Je comprends parfaitement ton souci de budget ! 💰 "
+                "Le Vapoteur Discount propose justement des packs économiques parfaits pour débuter. "
+                "Tu peux commencer avec un kit complet à moins de 30€ qui inclut tout le nécessaire. "
+                "L'investissement initial est vite rentabilisé : tu économiseras environ 150€/mois vs cigarettes !"
             )
+        
         if any(k in t for k in ["compliqué", "complexe", "difficile"]):
             return (
-                "Promis on simplifie : un pod simple (tirage auto), une résistance, "
-                "et 2 e‑liquides adaptés à ta nicotine. Tu auras 3 étapes maxi."
+                "Aucune inquiétude, c'est beaucoup plus simple qu'il n'y paraît ! 😊 "
+                "Les pods modernes sont ultra-simples : tu charges, tu remplis, tu vapes. "
+                "Pas de réglages compliqués. Je vais te guider vers les modèles les plus faciles, "
+                "avec notre marque Le Vapoteur Discount qui privilégie la simplicité."
             )
-        return "Je t’écoute : qu’est-ce qui te freine le plus ? Prix, simplicité, autonomie ou saveur ?"
+        
+        return "Dis-moi ce qui te préoccupe le plus : le prix, la simplicité, ou autre chose ?"
 
     def generate_qualification_questions(self) -> str:
-        q = [
-            "Tu fumes ~combien de cigarettes par jour ?",
-            "Tu préfères plutôt fruité, menthe, ou goût tabac ?",
-            "Tu veux quelque chose de très simple (pod) ou plus évolutif ?",
-        ]
-        if self.session_context.profile == "TRANSITION":
-            q.append("On vise des économies rapides : quel budget mensuel cibles-tu ?")
-        return "\n".join(f"- {x}" for x in q)
+        """
+        Génère des questions de qualification NON RÉPÉTÉES.
+        Vérifie les questions déjà posées et les préférences déjà connues.
+        """
+        all_questions = {
+            "cigarettes": "Combien de cigarettes fumes-tu par jour environ ?",
+            "gout": "Niveau goût, tu préfères fruité 🍓, menthe 🌿, ou tabac classique 🚬 ?",
+            "type": "Tu cherches quelque chose de très simple (pod) ou plus évolutif ?",
+            "budget": "Quel budget mensuel vises-tu pour la vape ?",
+            "nicotine": "Tu connais ton taux de nicotine idéal ou on détermine ensemble ?",
+            "autonomie": "L'autonomie est importante pour toi (usage intensif) ?",
+        }
+        
+        # Filtrer les questions : ne pas reposer celles déjà posées ou avec réponse
+        questions_to_ask = []
+        for key, question in all_questions.items():
+            # Ne pas poser si déjà posée ou si on a déjà la préférence
+            if key not in self.session_context.questions_asked and key not in self.session_context.user_preferences:
+                questions_to_ask.append(question)
+                self.session_context.questions_asked.add(key)
+                if len(questions_to_ask) >= 3:  # Maximum 3 questions à la fois
+                    break
+        
+        if not questions_to_ask:
+            return ""  # Toutes les infos sont déjà connues
+        
+        return "Pour te proposer le meilleur produit :\n" + "\n".join(f"• {q}" for q in questions_to_ask)
 
-    # --------- Génération IA (un seul appel) ---------
     def generate_response(self, user_query: str, model: str = "gpt-4o-mini") -> str:
+        """
+        Génère une réponse personnalisée en évitant les répétitions.
+        Privilégie les produits LVD et utilise les préférences stockées.
+        """
+        if not self.catalog_loaded:
+            return "⚠️ Le service est temporairement indisponible. Veuillez réessayer dans quelques instants."
+        
         ctx = self.build_context(user_query)
-        sys_prompt = (
-            "Tu es Trinity, conseiller expert de Le Vapoteur Discount.\n"
-            "Suit ces règles: max 4 produits, jamais reproposer ceux déjà montrés, "
-            "packs pour débutants, empathie sur objections, URLs exactes."
-        )
+        
+        # Vérifier si on a des objections
+        objection_keywords = ['cher', 'compliqué', 'difficile', 'pas sûr', 'hésite']
+        if any(k in user_query.lower() for k in objection_keywords):
+            obj_reply = self.handle_objection(user_query)
+            ctx += f"\n\nRÉPONSE À L'OBJECTION: {obj_reply}"
+        
+        # Générer des questions si nécessaire (seulement celles non posées)
+        if self.session_context.conversation_stage in ["discovery", "qualification"]:
+            q = self.generate_qualification_questions()
+            if q:
+                ctx += f"\n\nQUESTIONS DE QUALIFICATION (non répétées):\n{q}"
+        
+        # Prompt système avec instructions claires
+        sys_prompt = """Tu es Trinity, expert conseiller de Le Vapoteur Discount.
+
+RÈGLES CRITIQUES:
+1. TOUJOURS privilégier et mettre en avant la marque "Le Vapoteur Discount" ou "LVD" (marqués [⭐ MARQUE LVD])
+2. NE JAMAIS reposer les mêmes questions - vérifie QUESTIONS_DÉJÀ_POSÉES et PRÉFÉRENCES_CLIENT
+3. Si tu as déjà les infos dans PRÉFÉRENCES_CLIENT, passe directement aux recommandations
+4. Maximum 4 produits par réponse, avec au moins 1 produit LVD si disponible
+5. Utilise les URLs exactes fournies (format: domain/category/id-slug)
+6. Sois chaleureux et utilise quelques emojis
+
+ADAPTATION AU PROFIL:
+- DEBUTANT: Ultra pédagogue, packs complets LVD, explications simples
+- TRANSITION: Focus économies, comparaison cigarettes, ROI rapide
+- AVANCE: Technique, performance, nouveautés
+
+IMPORTANT: 
+- Si les préférences du client sont déjà dans PRÉFÉRENCES_CLIENT, NE PAS reposer ces questions
+- Propose directement des produits adaptés aux préférences connues
+- Mets TOUJOURS en avant les produits marqués [⭐ MARQUE LVD] en premier"""
+
         user_prompt = (
             f"Question: {user_query}\n\n{ctx}\n\n"
-            "Réponds de façon personnalisée selon PROFIL & STAGE. "
-            "Si info manquante, pose 2-3 questions ciblées. Réponse en français."
+            "INSTRUCTION: Réponds de façon personnalisée. "
+            "Si tu as déjà les infos nécessaires dans PRÉFÉRENCES_CLIENT, "
+            "propose directement des produits SANS reposer de questions. "
+            "Privilégie ABSOLUMENT les produits marqués [⭐ MARQUE LVD]."
         )
+        
+        # Appel à OpenAI
         resp = self.client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             temperature=0.7,
             max_tokens=700,
         )
-        return resp.choices[0].message.content.strip()
+        
+        # Mettre à jour le stage de conversation si on passe aux recommandations
+        response = resp.choices[0].message.content.strip()
+        if any(word in response.lower() for word in ["voici", "je te propose", "recommande"]):
+            self.session_context.conversation_stage = "recommendation"
+        
+        return response
 
-    # --------- Recherche produits interne ---------
     def _search_products(self, query: str, k: int = 10, exclude_ids: Optional[set] = None) -> List[Dict]:
+        """
+        Recherche de produits avec PRIORITÉ ABSOLUE aux produits LVD.
+        Les produits LVD sont toujours mis en avant.
+        """
         exclude_ids = exclude_ids or set()
         if not self.catalog:
             return []
+        
         scored = []
         for p in self.catalog:
             if p["id"] in exclude_ids:
                 continue
+            
             score = _score_match(p.get("name", ""), query)
-            # bonus marque si citée
+            
+            # BONUS FORT pour la marque LVD
+            if p.get("is_lvd"):
+                score += 10  # Bonus très élevé pour garantir la priorité
+            
+            # Bonus si marque citée dans la requête
             if p.get("brand") and p["brand"].lower() in (query or "").lower():
-                score += 1
-            # heuristique nicotine / type
+                score += 3
+            
+            # Heuristique nicotine
             if re.search(r"\b(10|12|16|18|20)\s*mg\b", query or "", re.I):
-                if re.search(r"(sel|nicotine)", p.get("name", ""), re.I):
-                    score += 1
+                if re.search(r"(sel|nicotine|\d+mg)", p.get("name", ""), re.I):
+                    score += 2
+            
+            # Bonus goût basé sur les préférences
+            query_lower = query.lower()
+            name_lower = p.get("name", "").lower()
+            
+            # Bonus pour correspondance de goût
+            if "fruit" in query_lower and any(f in name_lower for f in ["fruit", "fraise", "mangue", "cerise"]):
+                score += 2
+            if "tabac" in query_lower and any(t in name_lower for t in ["tabac", "blond", "brun", "classic"]):
+                score += 2
+            if "menth" in query_lower and any(m in name_lower for m in ["menth", "frais", "mint"]):
+                score += 2
+            
+            # Bonus pour type de produit
+            if "pod" in query_lower and "pod" in name_lower:
+                score += 2
+            if "kit" in query_lower and "kit" in name_lower:
+                score += 2
+            
             scored.append((score, p))
-        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Tri : score décroissant, puis LVD en priorité, puis prix croissant
+        scored.sort(key=lambda x: (-x[0], not x[1].get("is_lvd", False), x[1].get("price", 0)))
+        
+        # Prendre les meilleurs
         out = [p for s, p in scored[:k] if s > 0]
-        if not out:  # si rien de pertinent, prendre les moins chers
-            out = sorted([p for p in self.catalog if p["id"] not in exclude_ids], key=lambda x: x.get("price", 0))[:k]
-        return out
+        
+        # S'assurer qu'on a au moins quelques produits LVD dans le résultat
+        lvd_products = [p for p in self.catalog 
+                       if p.get("is_lvd") and p["id"] not in exclude_ids]
+        
+        # Ajouter des produits LVD s'il n'y en a pas assez
+        lvd_in_out = sum(1 for p in out if p.get("is_lvd"))
+        if lvd_in_out < 2 and lvd_products:  # On veut au moins 2 produits LVD
+            for p in lvd_products:
+                if p not in out:
+                    out.insert(0, p)  # Insérer en début de liste
+                    if len(out) > k:
+                        out.pop()  # Retirer le dernier
+                    lvd_in_out += 1
+                    if lvd_in_out >= 2:
+                        break
+        
+        return out[:k]
 
-    # --------- Utilitaires publics ---------
     def mark_shown(self, product_ids: List[int]) -> None:
+        """Marque des produits comme déjà montrés pour ne pas les reproposer."""
         for pid in product_ids:
             if pid not in self.session_context.products_shown:
                 self.session_context.products_shown.append(pid)
 
     def set_profile(self, profile: str) -> None:
+        """Change le profil du client."""
         profile = (profile or "").upper()
         if profile in {"DEBUTANT", "TRANSITION", "AVANCE"}:
             self.session_context.profile = profile
 
     def set_stage(self, stage: str) -> None:
+        """Change le stage de conversation."""
         stage = (stage or "").lower()
         if stage in {"discovery", "qualification", "recommendation", "closing"}:
             self.session_context.conversation_stage = stage
 
     def set_budget(self, budget: Optional[str]) -> None:
+        """Définit le budget du client."""
         self.session_context.budget = budget or None
 
+    def reset_session(self) -> None:
+        """Réinitialise la session (nouveau client)."""
+        self.session_context = SessionContext()
 
-# Usage rapide (debug):
+
+# Point d'entrée pour tests
 if __name__ == "__main__":
-    # Démo console minimale
+    # Test basique du bot
     bot = TrinityBot(
         prestashop_url=os.getenv("PRESTASHOP_URL"),
         prestashop_key=os.getenv("PRESTASHOP_API_KEY"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
+        products_limit=100,  # Limiter pour les tests
+        brands_limit=50,
+        categories_limit=50,
     )
-    bot.load_catalog_data()
-    print("Produits chargés:", len(bot.catalog))
-    ans = bot.generate_response("Je veux un kit pas cher avec e‑liquide fraise 12mg")
-    print("\nRéponse:\n", ans)
+    
+    try:
+        print("🔄 Chargement du catalogue...")
+        bot.load_catalog_data()
+        print(f"✅ Catalogue chargé: {len(bot.catalog)} produits")
+        
+        # Compter les produits LVD
+        lvd_count = sum(1 for p in bot.catalog if p.get("is_lvd"))
+        print(f"⭐ Produits Le Vapoteur Discount: {lvd_count}")
+        
+        # Test de conversation
+        query = "Je fume 15 cigarettes par jour, j'aime le fruité et je veux un truc simple"
+        print(f"\n💬 Question: {query}")
+        response = bot.generate_response(query)
+        print(f"\n🤖 Réponse:\n{response}")
+        
+        # Deuxième question (ne devrait pas reposer les mêmes questions)
+        query2 = "OK super, montre-moi les produits"
+        print(f"\n💬 Question: {query2}")
+        response2 = bot.generate_response(query2)
+        print(f"\n🤖 Réponse:\n{response2}")
+        
+    except ConnectionError as e:
+        print(f"❌ Erreur de connexion: {e}")
+    except Exception as e:
+        print(f"❌ Erreur: {e}")
