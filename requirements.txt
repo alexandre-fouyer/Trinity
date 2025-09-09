@@ -1,0 +1,4 @@
+# Python 3.9+
+streamlit>=1.33
+openai>=1.30
+requests>=2.31
